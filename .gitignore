@@ -1,0 +1,92 @@
+# ============================================================
+# go-infra .gitignore
+# 这是一个 Go 库仓库：只提交源码、测试与文档，不提交构建产物与本地环境文件
+# ============================================================
+
+# ---------- 构建产物 ----------
+# 二进制（go build / go test -c 产物，无扩展名也常出现在仓库根）
+/go-infra
+*.exe
+*.exe~
+*.dll
+*.so
+*.dylib
+*.test
+*.out
+!*_test.go
+
+# go build 生成的默认二进制名（按包目录名匹配，如需精确请按实际改名）
+/bin/
+/dist/
+/build/
+
+# ---------- Go 工具链 ----------
+# 覆盖率报告
+coverage.*
+*.cover
+*.coverprofile
+profile.cov
+
+# Go 工作区（多仓库本地联调用，不随库分发）
+go.work
+go.work.sum
+
+# 依赖目录：库仓库不提交 vendor，由 go.mod / go.sum 保证可复现构建
+/vendor/
+
+# 本机 vcs 缓存损坏时的备用开关，属本地文件
+.envrc
+
+# ---------- 测试 / 调试产物 ----------
+# 性能分析
+*.prof
+cpu.out
+mem.out
+block.out
+mutex.out
+trace.out
+
+# supervisor / 业务进程运行时产物
+*.pid
+*.pidfile
+/logs/
+/tmp/
+/temp/
+*.log
+
+# ---------- 敏感信息 ----------
+# 不要提交任何含口令的本地配置；DSN / 密码只放环境变量或本地文件
+.env
+.env.*
+!.env.example
+*.local
+*.local.yaml
+*.local.yml
+*.local.json
+secret*
+*.pem
+*.key
+
+# ---------- IDE ----------
+.idea/
+*.iml
+*.ipr
+*.iws
+.vscode/
+!.vscode/settings.json
+!.vscode/extensions.json
+.fleet/
+*.swp
+*.swo
+*~
+
+# ---------- 操作系统 ----------
+.DS_Store
+._*
+.Spotlight-V100
+.Trashes
+Thumbs.db
+ehthumbs.db
+Desktop.ini
+$RECYCLE.BIN/
+

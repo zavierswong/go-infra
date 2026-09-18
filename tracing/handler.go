@@ -1,0 +1,66 @@
+package tracing
+
+import (
+	"context"
+	"log/slog"
+
+	"go.opentelemetry.io/otel/trace"
+)
+
+// NewLogHandler 返回一个会在每条日志上追加 trace_id / span_id 的
+// slog.Handler 包装器（字段取自 ctx 中的当前 OTel span）。
+//
+// 用法：把它包在 logger 的底层 Handler 外层，进程内所有走
+// slog 的日志（含 logger 包全局函数与 Plog）在 span 存在时
+// 自动携带链路字段，不再依赖手工 logger.WithTraceID：
+//
+//	handler := tracing.NewLogHandler(logger.Default().Handler())
+//	logger.WrapHandler(handler) // 若 logger 包提供替换入口
+//	// 或自行 slog.New(handler) 构造业务专用 logger
+//
+// 语义细节：
+//   - 记录上已存在 trace_id 字段（例如业务先用 logger.WithTraceID
+//     注入了自定义 ID）时**不再追加**，避免 JSON 里出现重复键 ——
+//     两种机制可以共存，手工 ID 优先。
+//   - ctx 无有效 span 时不追加任何字段，日志输出与包装前完全一致。
+//   - 纯读包装：WithAttrs / WithGroup / Enabled 全部透传，
+//     不影响级别过滤与 caller 定位。
+func NewLogHandler(h slog.Handler) slog.Handler {
+	return traceHandler{Handler: h}
+}
+
+type traceHandler struct {
+	slog.Handler
+}
+
+func (h traceHandler) Handle(ctx context.Context, r slog.Record) error {
+	if sc := trace.SpanContextFromContext(ctx); sc.IsValid() && !hasTraceID(r) {
+		r.AddAttrs(
+			slog.String("trace_id", sc.TraceID().String()),
+			slog.String("span_id", sc.SpanID().String()),
+		)
+	}
+	return h.Handler.Handle(ctx, r)
+}
+
+func (h traceHandler) WithAttrs(attrs []slog.Attr) slog.Handler {
+	return traceHandler{Handler: h.Handler.WithAttrs(attrs)}
+}
+
+func (h traceHandler) WithGroup(name string) slog.Handler {
+	return traceHandler{Handler: h.Handler.WithGroup(name)}
+}
+
+// hasTraceID 检查记录是否已带 trace_id 字段（只看顶层，进组的字段
+// 语义已变，不算重复）。
+func hasTraceID(r slog.Record) bool {
+	found := false
+	r.Attrs(func(a slog.Attr) bool {
+		if a.Key == "trace_id" {
+			found = true
+			return false
+		}
+		return true
+	})
+	return found
+}

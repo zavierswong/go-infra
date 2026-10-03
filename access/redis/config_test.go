@@ -11,6 +11,7 @@ import (
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
 )
 
 // 本文件是**不需要 Redis** 的单元测试：配置校验、默认值、
@@ -63,6 +64,12 @@ func TestConfigNormalize(t *testing.T) {
 	if c.DisableContextTimeout {
 		t.Error("DisableContextTimeout 应默认为 false（即默认尊重 ctx 超时）")
 	}
+	// 维护通知默认关闭：留空必须落到 disabled。这条断言守住的是"不设置 ≠ 交给
+	// go-redis 决定"—— 传 nil 时 go-redis 会补成 auto，在每条新连接上发一条
+	// 注定失败的 CLIENT MAINT_NOTIFICATIONS，把日志和错误率一起搞脏。
+	if want := MaintNotificationsDisabled; c.MaintNotifications != want {
+		t.Errorf("MaintNotifications 应默认补成 %q，实际 %q", want, c.MaintNotifications)
+	}
 
 	// 硬上限低于基准池大小时，基准应被拉低到上限
 	c2 := Config{Addr: "a:6379", PoolSize: 100, MaxActiveConns: 20}.normalize()
@@ -112,6 +119,36 @@ func TestMaxRetriesSemantics(t *testing.T) {
 	}
 }
 
+// TestMaintNotificationsMode 覆盖 Config.MaintNotifications → go-redis 枚举的映射。
+//
+// 重点在**留空分支**：go-redis 的 MaintNotificationsConfig 为 nil 时会被
+// ApplyDefaults 补成 ModeAuto，也就是"每条新连接发一次协商"。自建 Redis 没有
+// CLIENT MAINT_NOTIFICATIONS 子命令，握手必然失败；客户端 fail-open，业务不受影响，
+// 但那条失败会经 ProcessHook 记成一次 CLIENT 错误，日志与错误率一起被污染。
+// 所以"没配"必须被翻译成 disabled，而不是把 nil 交给 go-redis 去决定。
+func TestMaintNotificationsMode(t *testing.T) {
+	cases := []struct {
+		name string
+		in   string
+		want maintnotifications.Mode
+	}{
+		{"留空（默认）", "", maintnotifications.ModeDisabled},
+		{"显式关闭", MaintNotificationsDisabled, maintnotifications.ModeDisabled},
+		{"自动协商", MaintNotificationsAuto, maintnotifications.ModeAuto},
+		{"强制协商", MaintNotificationsEnabled, maintnotifications.ModeEnabled},
+		{"未知取值兜底关闭", "yes", maintnotifications.ModeDisabled},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			cfg := Config{Addr: "a:6379", MaintNotifications: tc.in}.normalize()
+			if got := cfg.maintNotificationsMode(); got != tc.want {
+				t.Errorf("MaintNotifications=%q 应映射为 %q，实际 %q", tc.in, tc.want, got)
+			}
+		})
+	}
+}
+
 // TestOptionsMapping 逐字段断言 Config → goredis.Options 的映射。
 //
 // 这个测试的价值在于：漏传一个字段**不会报错**，只是配置静默失效。
@@ -124,6 +161,7 @@ func TestOptionsMapping(t *testing.T) {
 		DB:                    3,
 		ClientName:            "order-svc",
 		Protocol:              2,
+		MaintNotifications:    MaintNotificationsAuto,
 		PoolSize:              64,
 		MinIdleConns:          16,
 		MaxIdleConns:          32,
@@ -146,6 +184,13 @@ func TestOptionsMapping(t *testing.T) {
 		t.Fatalf("options() 失败: %v", err)
 	}
 
+	// 维护通知必须先判空：go-redis 在 nil 时会用 DefaultConfig() 补成 auto，
+	// 正是"没配却发了握手"的根源。
+	if opts.MaintNotificationsConfig == nil {
+		t.Fatal("options() 必须显式设置 MaintNotificationsConfig，" +
+			"否则 go-redis 会补成 ModeAuto 并在每条新连接上发一次协商")
+	}
+
 	checks := []struct {
 		name string
 		got  any
@@ -157,6 +202,7 @@ func TestOptionsMapping(t *testing.T) {
 		{"DB", opts.DB, cfg.DB},
 		{"ClientName", opts.ClientName, cfg.ClientName},
 		{"Protocol", opts.Protocol, cfg.Protocol},
+		{"MaintNotificationsConfig.Mode", opts.MaintNotificationsConfig.Mode, maintnotifications.ModeAuto},
 		{"PoolSize", opts.PoolSize, cfg.PoolSize},
 		{"MinIdleConns", opts.MinIdleConns, cfg.MinIdleConns},
 		{"MaxIdleConns", opts.MaxIdleConns, cfg.MaxIdleConns},
@@ -214,6 +260,12 @@ func TestConfigValidate(t *testing.T) {
 		{"Protocol 非法", Config{Addr: "a:6379", Protocol: 4}, "Protocol"},
 		{"MaxRetries 小于 -1", Config{Addr: "a:6379", MaxRetries: -2}, "MaxRetries"},
 
+		// MaintNotifications 只认三个小写取值。拼错必须报错而不是静默关闭：
+		// 否则一个本想开启 SCH 的部署会以为自己开启了。
+		{"MaintNotifications 拼写错误", Config{Addr: "a:6379", MaintNotifications: "disable"}, "MaintNotifications"},
+		{"MaintNotifications 大小写错误", Config{Addr: "a:6379", MaintNotifications: "AUTO"}, "MaintNotifications"},
+		{"MaintNotifications 误填布尔值", Config{Addr: "a:6379", MaintNotifications: "true"}, "MaintNotifications"},
+
 		// 单位哨兵：把毫秒整数直接写给 Duration 字段
 		{"ReadTimeout 单位写错", Config{Addr: "a:6379", ReadTimeout: 3000}, "ReadTimeout"},
 		{"DialTimeout 单位写错", Config{Addr: "a:6379", DialTimeout: 5000}, "DialTimeout"},
@@ -254,6 +306,9 @@ func TestConfigValidate(t *testing.T) {
 		{Addr: "a:6379", ConnMaxLifetime: -1},
 		{Addr: "a:6379", Protocol: 2},
 		{Addr: "a:6379", Protocol: 3},
+		{Addr: "a:6379", MaintNotifications: MaintNotificationsDisabled},
+		{Addr: "a:6379", MaintNotifications: MaintNotificationsAuto},
+		{Addr: "a:6379", MaintNotifications: MaintNotificationsEnabled},
 		{Addr: "a:6379", MinRetryBackoff: 8 * time.Millisecond},
 		{Addr: "a:6379", ConnMaxLifetime: time.Hour, ConnMaxLifetimeJitter: time.Minute},
 	} {

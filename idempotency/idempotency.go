@@ -67,6 +67,17 @@ var ErrInProgress = errors.New("idempotency: 另一次执行仍在进行中")
 //     该 key 自然失效。
 var ErrResultNotStored = errors.New("idempotency: 结果写入失败（副作用已发生）")
 
+// ErrResultCorrupted 表示缓存里存在结构合法（envelope 可解析）但 Value
+// 无法反序列化为本次调用的 T 的结果。典型成因：同一 key 被其他类型的
+// 调用点写入（跨服务共用默认前缀时尤其容易）、发版后结果结构体变更、
+// 外部误写共享的 Redis。
+//
+// 此时【不能】把它当作未命中继续执行 fn：副作用可能已经发生，重执行
+// 就是第二次副作用（支付去重场景 = 重复扣款），且调用方无从分辨。
+// 本包也【不】删除该缓存条目 —— 删除等于鼓励下一次请求重新执行；
+// 错误原样上抛，由调用方换 key 或人工清理，条目在 ResultTTL 后自然失效。
+var ErrResultCorrupted = errors.New("idempotency: 缓存结果与当前类型不兼容（副作用可能已发生）")
+
 // resultWriteAttempts 结果写入的尝试次数。
 //
 // 结果写不进去的代价远高于多试两次：副作用已经发生，而后续请求查不到
@@ -244,7 +255,10 @@ func tryReplay[T any](ctx context.Context, cli redis.UniversalClient, full strin
 	}
 	var v T
 	if err := json.Unmarshal(env.Value, &v); err != nil {
-		return Result[T]{}, false, nil
+		// envelope 合法但 Value 与 T 不兼容：绝不能静默当作未命中 ——
+		// 那会让 Do 重新执行 fn（第二次副作用）且调用方无从分辨。
+		// 也不删除条目（删除等于鼓励重执行），交给 ResultTTL 兜底。
+		return Result[T]{}, false, fmt.Errorf("%w: %v", ErrResultCorrupted, err)
 	}
 	return Result[T]{Value: v, Replayed: true}, true, nil
 }

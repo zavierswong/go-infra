@@ -324,6 +324,107 @@ func TestStaleResultDoesNotDecideHalfOpen(t *testing.T) {
 	}
 }
 
+// TestLegacyStaleResultDoesNotLeakProbe 回归测试（Critical 修复）：
+// 熔断前在途的慢请求先于探测结果返回时，不得让探测名额泄漏。
+//
+// 旧实现里 stale 是"按到达顺序数个数"的近似：探测结果若先到，会被
+// 误当陈旧结果吞掉且名额不回收，Allow 从此永久返回 ErrOpen —— 熔断器
+// 卡死在 HalfOpen，即使下游早已恢复。
+func TestLegacyStaleResultDoesNotLeakProbe(t *testing.T) {
+	b := newTestBreaker(Config{
+		FailureThreshold:  1,
+		OpenTimeout:       30 * time.Millisecond,
+		HalfOpenMaxProbes: 1,
+	})
+
+	// Closed 代放行慢调用 A（一直不返回）。
+	if err := b.Allow(); err != nil {
+		t.Fatalf("Closed 应放行: %v", err)
+	}
+	// B 失败触发熔断，此刻 stale = 1。
+	b.Record(errors.New("boom"))
+	time.Sleep(50 * time.Millisecond)
+
+	// 半开放行探测 C（legacy 路径）。
+	if err := b.Allow(); err != nil {
+		t.Fatalf("HalfOpen 应放行探测: %v", err)
+	}
+	// 探测 C 先成功返回：不得被当陈旧结果吞掉后卡死。
+	b.Record(nil)
+	if err := b.Allow(); err != nil {
+		t.Fatalf("探测名额被泄漏，Allow = %v（旧实现的永久卡死路径）", err)
+	}
+	// 新探测失败 → 正常重开，而不是永久 ErrOpen。
+	b.Record(errors.New("probe failed"))
+	if got := b.State(); got != StateOpen {
+		t.Fatalf("探测失败应重新熔断, got %v", got)
+	}
+}
+
+// TestTicketIgnoresStaleResults 票据路径必须精确区分代际：
+// 陈旧结果不得裁决 HalfOpen，也不得写进新一代的窗口。
+func TestTicketIgnoresStaleResults(t *testing.T) {
+	b := newTestBreaker(Config{
+		FailureThreshold:  1,
+		OpenTimeout:       30 * time.Millisecond,
+		HalfOpenMaxProbes: 1,
+	})
+
+	// Closed 代放行两个票据调用：A（慢）、B（立刻失败）。
+	tA, err := b.AllowTicket()
+	if err != nil {
+		t.Fatalf("Closed 应放行: %v", err)
+	}
+	tB, err := b.AllowTicket()
+	if err != nil {
+		t.Fatalf("Closed 应放行: %v", err)
+	}
+	b.RecordTicket(tB, errors.New("boom")) // trip → gen+1
+	time.Sleep(50 * time.Millisecond)
+
+	// 半开探测成功 —— 尽管陈旧的 A 尚未返回。
+	tP, err := b.AllowTicket()
+	if err != nil {
+		t.Fatalf("HalfOpen 应放行探测: %v", err)
+	}
+	b.RecordTicket(tP, nil)
+	if got := b.State(); got != StateClosed {
+		t.Fatalf("探测成功应回到 Closed, got %v", got)
+	}
+
+	// 陈旧的 A 此刻才返回（失败）：代数不匹配，必须被完整忽略。
+	b.RecordTicket(tA, errors.New("stale boom"))
+	if got := b.State(); got != StateClosed {
+		t.Errorf("上一代结果不得裁决当前状态, got %v", got)
+	}
+}
+
+// TestRecordSkippedReturnsProbeSlot RecordSkipped 只归还探测名额、
+// 不参与裁决 —— 对应 httpclient"调用方取消不算下游故障"的路径。
+func TestRecordSkippedReturnsProbeSlot(t *testing.T) {
+	b := newTestBreaker(Config{
+		FailureThreshold:  1,
+		OpenTimeout:       20 * time.Millisecond,
+		HalfOpenMaxProbes: 1,
+	})
+
+	b.Record(errors.New("boom")) // trip
+	time.Sleep(40 * time.Millisecond)
+
+	tP, err := b.AllowTicket()
+	if err != nil {
+		t.Fatalf("HalfOpen 应放行探测: %v", err)
+	}
+	b.RecordSkipped(tP) // 调用方取消：归还名额，不裁决
+	if got := b.State(); got != StateHalfOpen {
+		t.Fatalf("跳过的结果不应改变状态, got %v", got)
+	}
+	// 名额已归还：下一个探测立刻可以放行（旧实现下这里永久 ErrOpen）。
+	if _, err := b.AllowTicket(); err != nil {
+		t.Fatalf("探测名额应已归还, Allow = %v", err)
+	}
+}
+
 // TestStateString 状态名的稳定性（可能进监控/日志）。
 func TestStateString(t *testing.T) {
 	cases := map[State]string{

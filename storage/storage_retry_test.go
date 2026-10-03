@@ -644,3 +644,32 @@ func TestDefaultMaxPartsEffective(t *testing.T) {
 		t.Fatal("默认分片数上限应生效，超过 DefaultMaxParts 应被拒绝")
 	}
 }
+
+// TestPutObjectRetryRewindsToInitialOffset 回归测试：reader 已定位在
+// 非 0 偏移时，重试必须回卷到**初始偏移**而不是绝对 0。
+// 旧实现 rewind() 硬编码 Seek(0, SeekStart)：跳过文件头后上传正文、
+// 复用已部分读取的 *os.File 等场景下，重试会把偏移 0 起的错误内容
+// 静默上传（对象写成功、无任何报错、内容错位）。
+func TestPutObjectRetryRewindsToInitialOffset(t *testing.T) {
+	m := &mockStorage{putErrs: []error{netFail("first attempt fails"), nil}, consumeBody: true}
+	rs := NewRetryStorage(m, 1, time.Millisecond)
+
+	r := bytes.NewReader([]byte("AAAABBBB"))
+	if _, err := r.Seek(4, io.SeekStart); err != nil { // 意图上传 "BBBB"
+		t.Fatalf("seek: %v", err)
+	}
+	if err := rs.PutObject(context.Background(), "k", r, 4, "text/plain"); err != nil {
+		t.Fatalf("PutObject: %v", err)
+	}
+
+	if m.putCalls != 2 {
+		t.Fatalf("应尝试 2 次, got %d", m.putCalls)
+	}
+	if m.putBodies[0] != "BBBB" {
+		t.Errorf("首次上传应为偏移 4 起的内容, got %q", m.putBodies[0])
+	}
+	if m.putBodies[1] != "BBBB" {
+		t.Errorf("重试必须回卷到初始偏移（旧实现会错误地上传 %q）, got %q",
+			"AAAABBBB", m.putBodies[1])
+	}
+}

@@ -57,9 +57,11 @@ type Config struct {
 	MaxBackoff time.Duration
 
 	// RetryShould 自定义重试判定。为 nil 时用默认策略：
+	//   - 方法幂等（GET/HEAD/PUT/DELETE/OPTIONS/TRACE）——非幂等请求
+	//     （POST/PATCH）**不**自动重试：5xx 意味着下游可能已经执行，
+	//     重试等于重复副作用，需要时请显式提供本函数打开；
 	//   - 网络错误（err != nil，且不是 ctx 主动取消）；
-	//   - HTTP 429 / 500 / 502 / 503 / 504；
-	//   - 且方法幂等（GET/HEAD/PUT/DELETE/OPTIONS）或请求体可重放。
+	//   - HTTP 429 / 500 / 502 / 503 / 504。
 	//
 	// 自定义判定只决定"结果是否值得重试"，可重放性检查始终生效：
 	// 请求体存在但 GetBody 为 nil 时永远不重试。
@@ -142,7 +144,7 @@ func (cfg Config) logger() *slog.Logger {
 	return slog.Default()
 }
 
-func (cfg Config) retryEnabled() bool { return !cfg.RetryDisabled && cfg.MaxRetries > 0 }
+func (cfg Config) retryEnabled() bool { return !cfg.RetryDisabled }
 
 func (cfg Config) maxRetries() int {
 	if cfg.RetryDisabled {

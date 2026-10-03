@@ -179,6 +179,8 @@ type Exporter struct {
 	checks     []healthCheck
 	lastPool   map[string]metrics.PoolStats
 	lastKafka  map[string]KafkaStatus
+	poolKeys   map[string]struct{} // 已注册的池来源 key（去重）
+	kafkaKeys  map[string]struct{} // 已注册的 kafka 来源 key（去重）
 	healthStop chan struct{}
 
 	// collectMu 串行化一次 scrape 的全过程（见 Collect）：
@@ -244,6 +246,8 @@ func New(opts ...Option) *Exporter {
 		opts:      o,
 		lastPool:  make(map[string]metrics.PoolStats),
 		lastKafka: make(map[string]KafkaStatus),
+		poolKeys:  make(map[string]struct{}),
+		kafkaKeys: make(map[string]struct{}),
 	}
 
 	// ---- 事件通道：直方图观察全部事件，错误单独计数 ----

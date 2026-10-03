@@ -25,7 +25,16 @@ type rotateWriter struct {
 	cfg  RotateConfig
 	file *os.File
 	size int64
+
+	// lastRotateFail 上次轮转失败的时刻。轮转失败时降级为继续写当前
+	// 文件（宁可超限也不丢日志），但 size 仍超限会让每次 Write 都重试
+	// 轮转（每次一次 rename 系统调用）；用冷却窗口把重试频率压到
+	// rotateRetryCooldown 一次。
+	lastRotateFail time.Time
 }
+
+// rotateRetryCooldown 轮转失败后的重试冷却。期间直接降级写当前文件。
+const rotateRetryCooldown = 30 * time.Second
 
 // newRotateWriter 创建轮转写入器并打开日志文件
 func newRotateWriter(path string, cfg RotateConfig) (*rotateWriter, error) {
@@ -59,6 +68,12 @@ func (w *rotateWriter) open() error {
 }
 
 // Write 实现 io.Writer
+//
+// 轮转失败时降级为继续写当前文件，而不是把这条日志丢掉：
+// 旧实现在 rename 失败时直接 return，而 size 已被 open() 重置为当前
+// 体积（仍超限），下一次 Write 又会触发轮转、又失败 —— 目录权限被改、
+// 只读文件系统、容器磁盘异常等场景下**全部日志持续丢失**。
+// 日志轮转是非核心动作，核心动作是把日志写下去。
 func (w *rotateWriter) Write(p []byte) (int, error) {
 	w.mu.Lock()
 	defer w.mu.Unlock()
@@ -70,12 +85,20 @@ func (w *rotateWriter) Write(p []byte) (int, error) {
 	}
 
 	maxSize := int64(w.cfg.MaxSizeMB) << 20
-	if maxSize > 0 && w.size+int64(len(p)) > maxSize {
+	if maxSize > 0 && w.size+int64(len(p)) > maxSize && time.Since(w.lastRotateFail) >= rotateRetryCooldown {
 		if err := w.rotate(); err != nil {
-			return 0, err
+			w.lastRotateFail = time.Now()
+			// 降级：不丢日志，继续写当前文件。错误只打到 stderr
+			//（与 gzip 失败同等的提示强度），不影响本条与后续写入。
+			fmt.Fprintf(os.Stderr, "logger: 日志轮转失败（降级为继续写入当前文件）: %v\n", err)
 		}
 	}
 
+	if w.file == nil {
+		// 轮转失败且重开也失败：rotate 已把错误打进 stderr，
+		// 这里不再重试 open（避免每次 Write 都撞同一个错误），直接报错。
+		return 0, fmt.Errorf("日志文件 %s 不可写（轮转失败后未恢复）", w.path)
+	}
 	n, err := w.file.Write(p)
 	w.size += int64(n)
 	return n, err

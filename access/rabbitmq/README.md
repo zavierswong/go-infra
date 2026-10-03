@@ -301,7 +301,7 @@ sequenceDiagram
 | 防线 | 配置 | 防的是什么 |
 |---|---|---|
 | 持久化 | `Queue.Durable=true` + 默认 `persistent` | broker 重启丢消息（`Transient()` 关掉） |
-| Publisher Confirm | `Config.Confirm=true`（默认） | 消息没进 broker 但生产者以为成功了 |
+| Publisher Confirm | 默认开启（`DisableConfirm` 才关闭） | 消息没进 broker 但生产者以为成功了 |
 | mandatory | `WithMandatory()` | 消息不可路由，被 broker 静默丢弃 |
 
 **为什么 mandatory 是必需的**：不开它时，向一个不存在的队列或没有匹配绑定的交换机投递，broker 会**直接丢弃**且 `Publish` 返回 `nil`，调用方完全无从感知。开了之后 `Publish` 返回 `ErrUnroutable`。`TestMandatoryVersusSilentDrop` 覆盖了这个对比。
@@ -551,7 +551,7 @@ cli.Config()         // 生效后的配置（已补默认值、已展开延迟�
 
 | 字段 | mapstructure | 默认 | 说明 |
 |---|---|---|---|
-| `Confirm` | `confirm` | `true` | 生产通道开启 publisher confirm |
+| `DisableConfirm` | `disable_confirm` | `false` | 置 `true` 关闭 publisher confirm（默认开启；关闭后 Publish 返回 nil 只代表帧写进了 socket） |
 | `ConfirmTimeout` | `confirm_timeout` | `5s` | 等待 broker 确认的超时 |
 | `ReturnWindow` | `return_window` | `100ms` | mandatory 发布后等待 `basic.return` 的窗口，负值表示不等 |
 | `Prefetch` | `prefetch` | `1` | 消费者默认 QoS 预取条数 |
@@ -567,7 +567,7 @@ rabbitmq:
   vhost: app_vhost
   username: app
   password: "123456"
-  confirm: true
+  # confirm 默认开启，无需配置；确要关闭时用 disable_confirm: true
   prefetch: 10
   exchanges:
     - name: order

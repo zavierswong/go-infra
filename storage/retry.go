@@ -196,6 +196,24 @@ func sleepCtx(ctx context.Context, d time.Duration) error {
 type countingReader struct {
 	r io.Reader
 	n int64
+
+	// base 是 reader 的初始偏移（构造时记录）。回卷必须恢复到 base，
+	// 而不是绝对 0：调用方可能传入已定位在非 0 偏移的 Seeker
+	//（跳过文件头后上传正文、复用已部分读取的 *os.File 等），
+	// Seek(0, SeekStart) 会让重试上传"偏移 0 起"的错误内容 —— 静默
+	// 数据损坏，且只有恰好重试过的请求损坏，极难排查。
+	base     int64
+	haveBase bool
+}
+
+func newCountingReader(r io.Reader) *countingReader {
+	c := &countingReader{r: r}
+	if sk, ok := r.(io.Seeker); ok {
+		if pos, err := sk.Seek(0, io.SeekCurrent); err == nil {
+			c.base, c.haveBase = pos, true
+		}
+	}
+	return c
 }
 
 func (c *countingReader) Read(p []byte) (int, error) {
@@ -204,12 +222,14 @@ func (c *countingReader) Read(p []byte) (int, error) {
 	return n, err
 }
 
-// seekerIfPossible 若底层 reader 支持 Seek（含 unwrap *bytes.Reader 等具体类型），
-// 返回可直接回卷的 Seeker。
+// rewind 把 reader 回卷到构造时的初始偏移。无法确定初始偏移或不支持
+// Seek 时返回 false（按不可重放处理）。
 func (c *countingReader) rewind() bool {
-	type seeker interface{ io.Seeker }
-	if sk, ok := c.r.(seeker); ok {
-		if _, err := sk.Seek(0, io.SeekStart); err == nil {
+	if !c.haveBase {
+		return false
+	}
+	if sk, ok := c.r.(io.Seeker); ok {
+		if _, err := sk.Seek(c.base, io.SeekStart); err == nil {
 			c.n = 0
 			return true
 		}
@@ -227,12 +247,10 @@ func (s *RetryStorage) PutObject(ctx context.Context, key string, reader io.Read
 		return fmt.Errorf("文件大小 %d 超过限制 %d", size, maxSize)
 	}
 
-	var cr *countingReader
+	var cr = newCountingReader(reader)
 	return s.retry(ctx, "PutObject", func() error {
-		if cr == nil {
-			cr = &countingReader{r: reader}
-		} else if cr.n > 0 {
-			// 上一轮尝试消费了请求体：可回卷才允许重试。
+		if cr.n > 0 {
+			// 上一轮尝试消费了请求体：回卷到初始偏移才允许重试。
 			if !cr.rewind() {
 				return fmt.Errorf("%w（已消费 %d 字节）", ErrNotReplayable, cr.n)
 			}

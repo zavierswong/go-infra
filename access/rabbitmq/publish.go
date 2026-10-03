@@ -264,7 +264,7 @@ func (c *Client) publishOnce(ctx context.Context, msg amqp.Publishing, o publish
 		return err
 	}
 
-	if !c.cfg.Confirm {
+	if c.cfg.DisableConfirm {
 		if err := ch.PublishWithContext(ctx, o.exchange, o.routingKey, o.mandatory, false, msg); err != nil {
 			return fmt.Errorf("%w: %v", ErrPublish, err)
 		}

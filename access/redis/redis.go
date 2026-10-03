@@ -35,6 +35,7 @@ import (
 	"time"
 
 	goredis "github.com/redis/go-redis/v9"
+	"github.com/redis/go-redis/v9/maintnotifications"
 
 	"github.com/zavierswong/go-infra/logger"
 	"github.com/zavierswong/go-infra/metrics"
@@ -125,6 +126,13 @@ func (c Config) options() (*goredis.Options, error) {
 		ClientName: c.ClientName,
 		Protocol:   c.Protocol,
 
+		// 维护通知必须**显式**写入：go-redis 在 MaintNotificationsConfig 为 nil 时
+		// 会用 DefaultConfig() 补成 ModeAuto，我们无法用"不设置"来表达"关闭"。
+		// 详见 Config.MaintNotifications 的注释。
+		MaintNotificationsConfig: &maintnotifications.Config{
+			Mode: c.maintNotificationsMode(),
+		},
+
 		// 连接池
 		PoolSize:              c.PoolSize,
 		MinIdleConns:          c.MinIdleConns,
@@ -149,6 +157,22 @@ func (c Config) options() (*goredis.Options, error) {
 
 		TLSConfig: tlsCfg,
 	}, nil
+}
+
+// maintNotificationsMode 把 Config.MaintNotifications 翻译成 go-redis 的枚举。
+//
+// 未知取值一律落到 disabled。validate 已经拦下非法输入，这里只是最后一道保险，
+// 而两个方向的错法并不对称：少发一条命令最多是少一个特性，
+// 多发一条注定失败的握手则是给日志和错误率持续制造噪音。
+func (c Config) maintNotificationsMode() maintnotifications.Mode {
+	switch c.MaintNotifications {
+	case MaintNotificationsAuto:
+		return maintnotifications.ModeAuto
+	case MaintNotificationsEnabled:
+		return maintnotifications.ModeEnabled
+	default:
+		return maintnotifications.ModeDisabled
+	}
 }
 
 // Client 返回原生 go-redis 客户端，业务命令都通过它执行。

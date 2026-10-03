@@ -585,3 +585,33 @@ func TestCollectConcurrentRegistry(t *testing.T) {
 		t.Fatalf("并发 Gather 后 = %v, want 100", got)
 	}
 }
+
+// TestRegisterPoolDuplicateIgnored 回归测试：同 (component, instance) 的
+// 池来源重复注册必须被忽略。两个同 key 来源在 Collect 里会互相覆盖对方
+// 的"上一拍基线"，累计量被重复累加 —— 旧实现会静默产出成倍虚高的
+// pool_wait_total 等计数器。
+func TestRegisterPoolDuplicateIgnored(t *testing.T) {
+	pw := New()
+	var calls atomic.Int32
+	src := func() metrics.PoolStats {
+		calls.Add(1)
+		return metrics.PoolStats{Component: metrics.ComponentMySQL, Instance: "db1", WaitCount: 10}
+	}
+
+	pw.RegisterPool(src)
+	pw.RegisterPool(src) // 同 key：必须被忽略
+
+	if got := len(pw.pools); got != 1 {
+		t.Fatalf("重复注册应被忽略, pools = %d", got)
+	}
+
+	// kafka 侧同样的去重。
+	ksrc := func() KafkaStatus {
+		return KafkaStatus{Component: metrics.ComponentKafka, Instance: "k1"}
+	}
+	pw.RegisterKafkaStatus(ksrc)
+	pw.RegisterKafkaStatus(ksrc)
+	if got := len(pw.kafkas); got != 1 {
+		t.Fatalf("kafka 重复注册应被忽略, kafkas = %d", got)
+	}
+}

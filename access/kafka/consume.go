@@ -128,6 +128,12 @@ type Group struct {
 
 	// done 在 Run 退出后置位：此后底层客户端已关闭，Status 不再读水位。
 	done atomic.Bool
+
+	// track 维护"每分区连续成功水位"，nil 表示 DisableAutoCommit。
+	// 见 groupTracker 的说明 —— 它是把"失败不标记"变成真正可提交
+	// 语义的关键，不能直接用 MarkCommitRecords（marks 取最大 offset，
+	// 会让提交点越过失败记录）。
+	track *groupTracker
 }
 
 // NewGroup 校验配置并创建一个消费组（此时还未开始消费、未建连）。
@@ -202,12 +208,16 @@ func (c *Client) NewGroup(cfg GroupConfig) (*Group, error) {
 		return nil, fmt.Errorf("%w: 创建消费客户端失败: %v", ErrInvalidConfig, err)
 	}
 
-	return &Group{
+	g := &Group{
 		client: c,
 		cfg:    cfg,
 		cli:    cli,
 		jobs:   make(chan *kgo.Record, cfg.MaxPollRecords),
-	}, nil
+	}
+	if autoCommit {
+		g.track = newGroupTracker(cli)
+	}
+	return g, nil
 }
 
 // RunGroup 是"创建并运行消费组"的便捷写法（阻塞）。
@@ -268,10 +278,15 @@ func (g *Group) Run(ctx context.Context) error {
 			g.report(fmt.Errorf("group=%s 拉取 %s[%d] 失败: %w", g.cfg.Group, topic, part, err))
 		})
 
-		for it := fetches.RecordIter(); !it.Done(); it.Next() {
+		// 逐条派发给 worker。注意 RecordIter 的官方用法是 post 语句留空
+		//（Next() 自带"读取并前进"语义）：旧实现在 post 和 body 里各调
+		// 一次 Next()，每轮前进两格 —— 一半消息被静默丢弃，且记录数为
+		// 奇数时会在已排空的迭代器上越界 panic（Next() 内部是裸下标）。
+		for it := fetches.RecordIter(); !it.Done(); {
 			rec := it.Next()
 			select {
 			case g.jobs <- rec:
+				g.trackDispatch(rec)
 			case <-ctx.Done():
 			}
 			if ctx.Err() != nil {
@@ -365,7 +380,7 @@ func (g *Group) worker(ctx context.Context) {
 	}
 }
 
-// handle 执行一次处理并按结果标记位移。耗时口径是整个 handler 执行。
+// handle 执行一次处理并按结果维护连续成功水位。耗时口径是整个 handler 执行。
 func (g *Group) handle(ctx context.Context, rec *kgo.Record) error {
 	start := time.Now()
 	err := g.safeHandle(ctx, rec)
@@ -376,12 +391,18 @@ func (g *Group) handle(ctx context.Context, rec *kgo.Record) error {
 		Detail:   recordDetail(rec),
 	})
 	if err != nil {
+		// 失败记录是"不可提交的栅栏"：连续成功水位被钉在它身上，
+		// 之后同分区的记录即使全部成功也不会提交 —— 重启/再均衡后
+		// 从失败者开始重投（at-least-once）。
+		if g.track != nil {
+			g.track.settle(rec, false)
+		}
 		return err
 	}
-	// 只在成功后标记：失败记录不标记 → 提交点停在它之前 → 之后重投。
-	// 幂等 + at-least-once 是 Kafka 消费的标准姿势，不要在这里做"失败也标记"。
-	if !g.cfg.DisableAutoCommit {
-		g.cli.MarkCommitRecords(rec)
+	// 成功：尝试把连续成功水位向前推进并标记。只有水位真正前进时
+	// 才会产生一次 mark（见 groupTracker.settle）。
+	if g.track != nil {
+		g.track.settle(rec, true)
 	}
 	return nil
 }
@@ -447,6 +468,20 @@ func (g *Group) CommitSync(ctx context.Context) error {
 	return err
 }
 
+// trackDispatch / trackSettle 是 tracker 的 nil 安全包装
+// （DisableAutoCommit 时 track 为 nil，不维护水位）。
+func (g *Group) trackDispatch(rec *kgo.Record) {
+	if g.track != nil {
+		g.track.dispatch(rec)
+	}
+}
+
+func (g *Group) trackSettle(rec *kgo.Record, ok bool) {
+	if g.track != nil {
+		g.track.settle(rec, ok)
+	}
+}
+
 // report 输出消费侧错误：优先回调 OnError，否则记日志。
 func (g *Group) report(err error) {
 	if err == nil {
@@ -463,4 +498,130 @@ func (g *Group) report(err error) {
 // 只放定位信息（主题/分区/位移），**不放消息体** —— 消息体是业务数据。
 func recordDetail(rec *kgo.Record) string {
 	return fmt.Sprintf("%s[%d]@%d", rec.Topic, rec.Partition, rec.Offset)
+}
+
+// ---- 连续成功水位：把"失败不标记"变成真正可提交的语义 ----
+
+// tpKey 标识一个 topic 分区。
+type tpKey struct {
+	topic string
+	part  int32
+}
+
+// groupTracker 维护"每分区连续成功水位"，只在水位真正前进时调用
+// MarkCommitOffsets。
+//
+// 为什么不能用 MarkCommitRecords：franz-go 的 marks 语义是"已标记记录
+// 中的最大 offset"，**没有任何连续性检查**（consumer_group.go 中 head
+// 直接取 max，且官方文档明确 "does not allow rewinds"）。于是默认配置
+// 下（StopOnHandlerError=false，失败后继续消费后续记录）：
+//
+//	rec0 失败(未 mark) → rec1..rec9 成功(mark) → 提交点 = 10
+//
+// 提交点一越过 rec0 就再也无法回退 —— rec0 既不会被当前进程重投，
+// 重启后也不会重放，at-least-once 被静默打破。Concurrency > 1 时
+// 乱序完成让这个窗口更大。
+//
+// 这里改为：每个分区维护"最小未成功 offset"，它就是可提交的水位 ——
+// 失败记录成为不可提交的栅栏，水位之后的记录即使全部成功也不会提交，
+// 重启/再均衡后从失败者开始重投。这正是 Handler 文档承诺的语义。
+//
+// 内存：每个分区 O(1)（inflight 只含在途记录，失败只记最小的一个 ——
+// 失败不重试，最小失败者本身就是永久栅栏，更大 offset 的失败不影响
+// 水位，无需逐一记录）。
+type groupTracker struct {
+	cli *kgo.Client
+
+	mu    sync.Mutex
+	parts map[tpKey]*partProgress
+}
+
+// partProgress 是一个分区的连续成功水位。
+type partProgress struct {
+	// next 是下一个期望派发的 offset（即"last dispatched + 1"）。
+	// 派发时若 offset 出现空洞（如事务控制记录被驱动过滤），空洞
+	// 视为已消费，next 直接跳过去。
+	next int64
+	// inflight 记录已派发、尚未结算（handler 未返回）的 offset 及其
+	// 次数（同 offset 重复派发只会在 rewind 后出现）。
+	inflight map[int64]int
+	// failedMin 是最早失败的 offset。失败不会被本进程重试，它是
+	// 永久栅栏；更大的失败 offset 无需记录（水位钉在 failedMin）。
+	hasFailed bool
+	failedMin int64
+	// lastEpoch 是最近一次派发记录的 leader epoch，mark 时随 head 上报。
+	lastEpoch int32
+	// marked 是已向 client mark 过的水位，-1 表示从未（marks 不允许
+	// 回退，head 没有前进时不重复 mark）。
+	marked int64
+}
+
+func newGroupTracker(cli *kgo.Client) *groupTracker {
+	return &groupTracker{cli: cli, parts: make(map[tpKey]*partProgress)}
+}
+
+// dispatch 在记录派发给 worker 之前登记在途。未派发成功的记录
+// （ctx 取消分支）不会走到这里，因此不会污染水位。
+func (t *groupTracker) dispatch(rec *kgo.Record) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	key := tpKey{rec.Topic, rec.Partition}
+	p := t.parts[key]
+	if p == nil {
+		p = &partProgress{next: rec.Offset + 1, marked: -1, inflight: make(map[int64]int)}
+		t.parts[key] = p
+	}
+	p.inflight[rec.Offset]++
+	if rec.Offset >= p.next {
+		p.next = rec.Offset + 1 // offset 空洞（过滤掉的控制记录）：视为已消费
+	}
+	p.lastEpoch = rec.LeaderEpoch
+}
+
+// settle 在 handler 返回后结算：成功则尝试推进水位并 mark，失败则
+// 把水位钉在自己身上。
+func (t *groupTracker) settle(rec *kgo.Record, ok bool) {
+	t.mu.Lock()
+	defer t.mu.Unlock()
+
+	p := t.parts[tpKey{rec.Topic, rec.Partition}]
+	if p == nil {
+		return // 不可达：settle 之前必有 dispatch；防御而已
+	}
+	if n := p.inflight[rec.Offset]; n > 1 {
+		p.inflight[rec.Offset] = n - 1
+	} else {
+		delete(p.inflight, rec.Offset)
+	}
+	if ok {
+		p.lastEpoch = rec.LeaderEpoch
+	} else if !p.hasFailed || rec.Offset < p.failedMin {
+		p.hasFailed = true
+		p.failedMin = rec.Offset
+	}
+
+	head := t.headLocked(p)
+	if head <= p.marked {
+		return // 水位没有前进（或 rewind），marks 不允许回退
+	}
+	p.marked = head
+	t.cli.MarkCommitOffsets(map[string]map[int32]kgo.EpochOffset{
+		rec.Topic: {rec.Partition: {Epoch: p.lastEpoch, Offset: head}},
+	})
+}
+
+// headLocked 计算可提交水位：全部结算到底时是 next，否则是最小的
+// 未成功 offset（在途或失败）。
+func (t *groupTracker) headLocked(p *partProgress) int64 {
+	head := p.next
+	if p.hasFailed && p.failedMin < head {
+		head = p.failedMin
+	}
+	for off := range p.inflight {
+		if off < head {
+			head = off
+		}
+	}
+	return head
 }

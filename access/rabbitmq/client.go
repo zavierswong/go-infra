@@ -341,7 +341,7 @@ func (c *Client) buildPubChannel(conn *amqp.Connection) (*amqp.Channel, error) {
 		return nil, fmt.Errorf("%w: 打开发布通道失败: %v", ErrNotConnected, err)
 	}
 
-	if c.cfg.Confirm {
+	if !c.cfg.DisableConfirm {
 		// Confirm 必须开启：否则 Publish 返回 nil 只代表"帧写进了 socket"，
 		// 不代表 broker 收下了消息，也就没有任何持久化保证可言。
 		if err := ch.Confirm(false); err != nil {

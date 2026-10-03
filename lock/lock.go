@@ -39,6 +39,7 @@ import (
 	"crypto/rand"
 	"encoding/hex"
 	"errors"
+	"fmt"
 	"sync"
 	"sync/atomic"
 	"time"
@@ -132,6 +133,11 @@ func New(cli redis.UniversalClient, opts ...Option) *Client {
 //
 // ctx 只约束获取动作本身（网络往返），不影响锁的持有期。
 func (c *Client) Acquire(ctx context.Context, key string, ttl time.Duration) (*Lock, error) {
+	if ttl <= 0 {
+		// SETNX 不带 TTL 的锁永不消失：持有者崩溃后整个临界区
+		// 永久死锁，且看门狗也救不回来（续期依赖锁存在）。
+		return nil, fmt.Errorf("lock: ttl 必须 > 0（收到 %v）：无 TTL 的锁在持有者崩溃后无法自动释放", ttl)
+	}
 	token, err := newToken()
 	if err != nil {
 		return nil, err
@@ -221,7 +227,12 @@ func (l *Lock) Unlock(ctx context.Context) error {
 // Refresh 把锁续期到 ttl。
 //
 // 用于手动续期（未开看门狗时）；锁已易主或过期返回 ErrLost。
+// ttl 必须 > 0：PEXPIRE 非正值在 Redis 语义里是"立即删除键"，
+// 等于亲手把锁拆掉。
 func (l *Lock) Refresh(ctx context.Context, ttl time.Duration) error {
+	if ttl <= 0 {
+		return fmt.Errorf("lock: ttl 必须 > 0（收到 %v）：对键执行非正过期会立即删除键", ttl)
+	}
 	n, err := refreshScript.Run(ctx, l.c.cli, []string{l.key}, l.token, ttl.Milliseconds()).Int()
 	if err != nil {
 		return err

@@ -22,6 +22,7 @@ func newTestLogger(buf *bytes.Buffer) *slog.Logger {
 }
 
 // TestRetryOn5xx 5xx 触发重试，GetBody 重放请求体，最终拿到成功响应。
+// 方法用 PUT（幂等）：默认策略不重试非幂等方法（见 TestNoRetryOnPost）。
 func TestRetryOn5xx(t *testing.T) {
 	var attempts atomic.Int32
 	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
@@ -47,7 +48,7 @@ func TestRetryOn5xx(t *testing.T) {
 		Backoff:    time.Millisecond,
 	})
 
-	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPut,
 		srv.URL, bytes.NewBufferString("hello"))
 	resp, err := c.Do(req)
 	if err != nil {
@@ -61,6 +62,98 @@ func TestRetryOn5xx(t *testing.T) {
 		t.Fatalf("应尝试 3 次, got %d", got)
 	}
 }
+
+// TestNoRetryOnPost 回归测试：非幂等的 POST 即使请求体可重放
+// （GetBody 非 nil，甚至没有 body）也不得被默认策略重试 ——
+// 5xx 意味着下游可能已经执行，重试等于重复副作用。
+// 旧实现只检查"可重放性"从不读 req.Method，POST 会被打 3 次。
+func TestNoRetryOnPost(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusInternalServerError)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := httpclient.New(httpclient.Config{MaxRetries: 5, Backoff: time.Millisecond})
+
+	// 无 body 的 POST：GetBody 检查直接通过，必须被幂等检查拦下。
+	req, _ := http.NewRequestWithContext(context.Background(), http.MethodPost, srv.URL, nil)
+	resp, err := c.Do(req)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp.Body.Close()
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("非幂等 POST 不应重试, attempts=%d", got)
+	}
+
+	// 带 GetBody 的 POST（bytes.Reader 会自动生成）同样不重试。
+	attempts.Store(0)
+	req2, _ := http.NewRequestWithContext(context.Background(), http.MethodPost,
+		srv.URL, bytes.NewBufferString("payload"))
+	resp2, err := c.Do(req2)
+	if err != nil {
+		t.Fatalf("Do: %v", err)
+	}
+	resp2.Body.Close()
+	if got := attempts.Load(); got != 1 {
+		t.Fatalf("可重放的 POST 同样不应重试, attempts=%d", got)
+	}
+}
+
+// TestDefaultMaxRetries 回归测试：零值 Config 必须启用默认 2 次重试。
+// 旧实现 retryEnabled() 要求 MaxRetries > 0，把整层重试直接不装配，
+// 与 Config.MaxRetries 的文档（"<=0 按 DefaultMaxRetries 处理"）矛盾。
+func TestDefaultMaxRetries(t *testing.T) {
+	var attempts atomic.Int32
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, _ *http.Request) {
+		attempts.Add(1)
+		w.WriteHeader(http.StatusServiceUnavailable)
+	}))
+	t.Cleanup(srv.Close)
+
+	c := httpclient.New(httpclient.Config{}) // 零值：未设 MaxRetries、未禁用
+	resp, err := c.Get(srv.URL)
+	if err != nil {
+		t.Fatalf("Get: %v", err)
+	}
+	resp.Body.Close()
+	if got := attempts.Load(); got != 1+httpclient.DefaultMaxRetries {
+		t.Fatalf("零值 Config 应默认重试 %d 次, attempts=%d", httpclient.DefaultMaxRetries, got)
+	}
+}
+
+// TestCloseIdleConnectionsPassthrough 回归测试：包装层必须把
+// CloseIdleConnections 透传到底层 Transport。
+// http.Client 的实现依赖运行时类型断言，包装层不实现该方法时
+// 整个调用被静默吞掉，优雅退出时空闲连接无法释放。
+func TestCloseIdleConnectionsPassthrough(t *testing.T) {
+	var closed atomic.Int32
+	base := &countingCloseTransport{inner: http.DefaultTransport, closed: &closed}
+
+	c := httpclient.New(httpclient.Config{
+		RetryDisabled: true,
+		Breaker:       breaker.New(breaker.Config{}),
+		Transport:     base,
+	})
+	c.CloseIdleConnections()
+
+	if got := closed.Load(); got != 1 {
+		t.Fatalf("CloseIdleConnections 应透传到底层 Transport, 调用 %d 次", got)
+	}
+}
+
+type countingCloseTransport struct {
+	inner  http.RoundTripper
+	closed *atomic.Int32
+}
+
+func (t *countingCloseTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	return t.inner.RoundTrip(req)
+}
+
+func (t *countingCloseTransport) CloseIdleConnections() { t.closed.Add(1) }
 
 // TestNoRetryOnPostWithoutGetBody 带体但 GetBody 为 nil 的非幂等请求不重试。
 func TestNoRetryOnPostWithoutGetBody(t *testing.T) {

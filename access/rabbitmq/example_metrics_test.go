@@ -85,8 +85,8 @@ func ExampleClient_observer() {
 		Name:     "order-mq",
 		Observer: obs,
 
-		// 开确认后才能区分"已落 broker"与"发出去了但没人收"。
-		Confirm: true,
+		// confirm 默认开启：Publish 返回 nil 即代表"已落 broker"，
+		// 与"发出去了但没人收"（ErrUnroutable）可区分。
 	})
 	if err != nil {
 		log.Fatal(err)

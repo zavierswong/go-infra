@@ -44,6 +44,31 @@ type Config struct {
 	// 老版本服务端不支持 RESP3 时设为 2。
 	Protocol int `mapstructure:"protocol"`
 
+	// MaintNotifications 控制建连时是否协商「维护通知」
+	// （Smart Client Handoffs，SCH）。取值见下面的 MaintNotifications* 常量，
+	// **留空等于 MaintNotificationsDisabled**。
+	//
+	// 背景：SCH 是 Redis Cloud / Redis Enterprise 的能力，需在服务端开启
+	// client_maint_notifications；它靠 CLIENT MAINT_NOTIFICATIONS 这条命令
+	// 在**每条新连接的握手**里协商，之后才能收到 RESP3 push 通知。
+	// 自建 Redis OSS/CE、Valkey 以及多数云厂商托管版都没有这个子命令。
+	//
+	// 为什么默认关闭：go-redis 自己的默认值是 auto，而且
+	// **MaintNotificationsConfig 传 nil 也会被 ApplyDefaults 补成 auto**
+	// （源码注释写着 "Enable by default for Redis Cloud"），
+	// 所以"不设置"并不等于"关闭"。于是每条新连接都会发一条注定失败的
+	// CLIENT MAINT_NOTIFICATIONS —— 客户端 fail-open，连接照常可用、业务不受影响，
+	// 但那条失败会流经本包注册的 Hook：日志里多一条 "Redis 命令失败: client"，
+	// metrics 里多一条 CLIENT 错误，错误率曲线与告警阈值被持续污染。
+	//
+	// 需要 SCH 的部署显式开启：先用 auto（协商失败自动降级，连接不受影响），
+	// 确认服务端支持后再考虑 enabled —— enabled 是 fail-fast 语义，
+	// 服务端不支持时**建连直接失败**，混合环境里会很脆。
+	//
+	// 另外 SCH 依赖 RESP3 的 push 消息：Protocol=2 时 go-redis 不会发这条握手，
+	// 该字段随之失去意义。
+	MaintNotifications string `mapstructure:"maint_notifications"`
+
 	// TLS 是可选的安全连接配置。
 	TLS TLSConfig `mapstructure:"tls"`
 
@@ -202,6 +227,25 @@ type TLSConfig struct {
 	KeyFile  string `mapstructure:"key_file"`
 }
 
+// 维护通知（Smart Client Handoffs）的协商模式，取值用于 Config.MaintNotifications。
+//
+// 这里用导出常量而不是裸字符串：它们是配置面的一部分，
+// 而拼写错误（"disable" / "AUTO" / "true"）要么被 validate 拦下，
+// 要么悄悄落到默认分支 —— 常量能让编译器和补全帮忙减少这类讨论。
+const (
+	// MaintNotificationsDisabled 不协商维护通知。
+	// Config.MaintNotifications 留空时的默认值。
+	MaintNotificationsDisabled = "disabled"
+
+	// MaintNotificationsAuto 尝试协商，服务端不支持时静默降级，连接不受影响。
+	// 与 go-redis 的 ModeAuto 对应，仅建议在确认服务端支持 SCH 的场合使用。
+	MaintNotificationsAuto = "auto"
+
+	// MaintNotificationsEnabled 强制协商，服务端不支持时**建连失败**。
+	// 仅建议在确定所有节点都支持 SCH 时使用。
+	MaintNotificationsEnabled = "enabled"
+)
+
 // 默认值。集中在这里，便于 README 与测试对齐。
 const (
 	defaultDialTimeout     = 5 * time.Second
@@ -236,6 +280,9 @@ func (c Config) ready() (Config, error) {
 func (c Config) normalize() Config {
 	if c.Protocol < 0 {
 		c.Protocol = 0
+	}
+	if c.MaintNotifications == "" {
+		c.MaintNotifications = MaintNotificationsDisabled
 	}
 	if c.PoolSize <= 0 {
 		c.PoolSize = defaultPoolSize()
@@ -310,6 +357,19 @@ func (c Config) validate() error {
 	}
 	if c.Protocol != 0 && c.Protocol != 2 && c.Protocol != 3 {
 		return fmt.Errorf("%w: Protocol=%d 非法，只支持 0（默认 RESP3）/ 2 / 3", ErrInvalidConfig, c.Protocol)
+	}
+
+	// MaintNotifications：留空是合法的（normalize 会补成 disabled）,
+	// 但拼错的取值必须报错 —— 否则它会静默落到"关闭"，
+	// 让一个本想开启 SCH 的部署以为自己开启了。
+	switch c.MaintNotifications {
+	case "", MaintNotificationsDisabled, MaintNotificationsAuto, MaintNotificationsEnabled:
+	default:
+		return fmt.Errorf(
+			"%w: MaintNotifications=%q 非法，只支持 %q / %q / %q（留空等于 %q）",
+			ErrInvalidConfig, c.MaintNotifications,
+			MaintNotificationsDisabled, MaintNotificationsAuto, MaintNotificationsEnabled,
+			MaintNotificationsDisabled)
 	}
 
 	// MaxRetries：-1 是 go-redis 定义的"禁用重试"。允许它，但要求显式了解。

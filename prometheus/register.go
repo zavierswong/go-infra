@@ -2,6 +2,7 @@ package prometheus
 
 import (
 	"context"
+	"log/slog"
 	"sync"
 	"time"
 
@@ -40,14 +41,33 @@ type MQStatus struct {
 //
 //	pw.RegisterPool(db.PoolStats)
 //
-// 快照在每次 scrape 时现取，不做缓存；同一来源注册多次没有意义。
+// 快照在每次 scrape 时现取，不做缓存。
+//
+// 同一个 (component, instance) 只允许注册一个来源，重复注册会被忽略并
+// 打一条告警日志。这不是洁癖：两个来源的 key 相同时，它们在 Collect 里
+// 会互相覆盖对方的"上一拍基线"，累计量（wait / hits / misses 等计数器）
+// 被重复累加 —— 暴露值成倍虚高且随 scrape 次数持续放大，比缺曲线危险
+// 得多。典型成因是把同一个客户端注册了两次，或两个客户端的 Config.Name
+// 撞名。
 func (e *Exporter) RegisterPool(source func() metrics.PoolStats) {
 	if source == nil {
 		return
 	}
+	// 注册期先取一次快照拿 (component, instance)：key 只有来源自己知道。
+	// 快照是纯内存读取，这次额外调用没有副作用，也不影响 Collect 的
+	// 增量基线（lastPool 在首次 Collect 才写入）。
+	first := source()
+	key := poolKey(first.Component, first.Instance)
+
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, dup := e.poolKeys[key]; dup {
+		slog.Warn("prometheus: 同名池快照来源重复注册，已忽略（累计量会被重复累加，请检查 Config.Name 是否撞名）",
+			"component", string(first.Component), "instance", first.Instance)
+		return
+	}
+	e.poolKeys[key] = struct{}{}
 	e.pools = append(e.pools, source)
-	e.mu.Unlock()
 }
 
 // RegisterStatus 注册一个组件状态快照来源（目前对应 rabbitmq 的 Status）。
@@ -104,9 +124,20 @@ func (e *Exporter) RegisterKafkaStatus(source func() KafkaStatus) {
 	if source == nil {
 		return
 	}
+	// 与 RegisterPool 相同的去重逻辑：key 撞名的两个来源会共用同一条
+	// status_closed / 缓冲水位序列，互相覆盖对方的值。
+	first := source()
+	key := poolKey(first.Component, first.Instance)
+
 	e.mu.Lock()
+	defer e.mu.Unlock()
+	if _, dup := e.kafkaKeys[key]; dup {
+		slog.Warn("prometheus: 同名 kafka 快照来源重复注册，已忽略",
+			"component", string(first.Component), "instance", first.Instance)
+		return
+	}
+	e.kafkaKeys[key] = struct{}{}
 	e.kafkas = append(e.kafkas, source)
-	e.mu.Unlock()
 }
 
 // RegisterHealth 注册一个探活来源，结果反映在 component_up 上。

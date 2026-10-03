@@ -54,7 +54,6 @@ func testConfig(t *testing.T) Config {
 		Username:     envOr("TEST_RABBITMQ_USER", "app"),
 		Password:     envOr("TEST_RABBITMQ_PASS", "123456"),
 		DialAttempts: 1, // 测试里失败要立刻暴露，不重试
-		Confirm:      true,
 		ReturnWindow: 300 * time.Millisecond,
 		Prefetch:     1,
 	}

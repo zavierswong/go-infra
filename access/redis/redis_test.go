@@ -136,6 +136,41 @@ func TestOpenAndHealth(t *testing.T) {
 	}
 }
 
+// TestNoFailingClientCommandDuringHandshake 是"假错误"的直接回归。
+//
+// go-redis 的 MaintNotificationsConfig 传 nil 时会被 ApplyDefaults 补成
+// ModeAuto（源码注释写着 "Enable by default for Redis Cloud"），于是**每条新连接的
+// 握手里**都会发一条 CLIENT MAINT_NOTIFICATIONS。自建 Redis（OSS/CE、Valkey
+// 以及多数云厂商托管版）没有这个子命令，握手必然失败 —— 客户端 fail-open，
+// 连接照常可用、业务不受影响，但那条失败会流经本包注册的 ProcessHook：
+// 日志里出现 "Redis 命令失败: client"，metrics 里多一条 CLIENT 错误，
+// 错误率与告警阈值被污染。
+//
+// 本包默认把维护通知关掉（MaintNotifications 留空 → disabled），
+// 建连阶段就不该出现任何失败的 CLIENT 命令。
+//
+// 这条断言的语义与具体服务端无关：在原生支持 SCH 的服务端上，即使有人把默认值
+// 改回 auto，握手也会成功、用例不会变红 —— 而那正是我们要的"没有假错误"，
+// 不算漏测。真正锁死默认值的是 config_test.go 里的映射用例。
+func TestNoFailingClientCommandDuringHandshake(t *testing.T) {
+	rec := &eventRecorder{}
+	r := openClient(t, metricsConfig(t, rec))
+
+	// 再发一条业务命令，确保连接已经真正建好并被使用过。
+	if err := r.Client().Ping(context.Background()).Err(); err != nil {
+		t.Fatalf("PING 失败: %v", err)
+	}
+
+	for _, e := range rec.snapshot() {
+		if e.Op != "CLIENT" {
+			continue
+		}
+		if e.IsError() {
+			t.Errorf("建连握手出现失败的 CLIENT 命令（维护通知应默认关闭）: %v", e.Err)
+		}
+	}
+}
+
 // TestPoolSettingsActuallyApplied 断言池参数真的落到了 go-redis 上。
 func TestPoolSettingsActuallyApplied(t *testing.T) {
 	cfg := testConfig(t)

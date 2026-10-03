@@ -135,9 +135,15 @@ type Config struct {
 	DialBackoff    time.Duration `mapstructure:"dial_backoff"`
 	DialMaxBackoff time.Duration `mapstructure:"dial_max_backoff"`
 
-	// Confirm 是否为生产通道开启 publisher confirm。默认 true。
-	// 关闭后 Publish 无法得知 broker 是否真的收下了消息，只应在极在意吞吐时关闭。
-	Confirm bool `mapstructure:"confirm"`
+	// DisableConfirm 关闭生产通道的 publisher confirm。**默认开启
+	// confirm**（bool 零值 = 不关闭）：Publish 返回 nil 即代表 broker
+	// 已确认收下，这是"端到端不丢消息"的前提。
+	//
+	// 为什么不用 `Confirm bool` 表达"默认 true"：bool 零值是 false，
+	// 无法区分「未设置」与「显式关闭」，旧字段导致按文档写配置的使用方
+	// 实际拿到的是关闭的 confirm（消息可靠性静默降级为"帧写进 socket
+	// 即成功"）。只有极在意吞吐、且能接受静默丢消息时才应关闭。
+	DisableConfirm bool `mapstructure:"disable_confirm"`
 	// ConfirmTimeout 等待 broker 确认的超时，0 表示默认 5s。
 	ConfirmTimeout time.Duration `mapstructure:"confirm_timeout"`
 	// ReturnWindow 是 mandatory 发布后等待 basic.return 的窗口：

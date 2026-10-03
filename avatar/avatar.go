@@ -182,6 +182,11 @@ func (g *Generator) GenerateSVG(opts Options) (string, error) {
 }
 
 // style 取出（必要时解析并缓存）指定风格。
+//
+// 白名单（styles.Get）未命中的名字**不缓存**：缓存 key 直接来自
+// 调用方（Options.Style 很可能透传外部输入），未知风格也入缓存的话，
+// 每个不同的非法名字都会留下一条永不淘汰的条目 —— 无界内存，可被
+// 外部输入打爆。已知的解析失败（61 个风格内）才会缓存，数量有界。
 func (g *Generator) style(name string) (*dicebear.Style, error) {
 	g.mu.RLock()
 	entry, ok := g.cache[name]
@@ -190,18 +195,21 @@ func (g *Generator) style(name string) (*dicebear.Style, error) {
 		return entry.style, entry.err
 	}
 
-	// 走到这里说明该风格尚未缓存。全程持写锁，保证同一风格只解析一次；
-	// 只有冷启动的首次调用会付出这次锁开销。
+	def, found := styles.Get(name)
+	if !found {
+		return nil, fmt.Errorf("%w: %q（可用风格见 Styles()）", ErrUnknownStyle, name)
+	}
+
+	// 走到这里说明该风格合法但尚未缓存。全程持写锁，保证同一风格
+	// 只解析一次；只有该风格的首次调用会付出这次锁开销。
 	g.mu.Lock()
 	defer g.mu.Unlock()
-	if entry, ok := g.cache[name]; ok {
-		return entry.style, entry.err
+	if cached, ok := g.cache[name]; ok {
+		return cached.style, cached.err
 	}
 
 	entry = &styleEntry{}
-	if def, found := styles.Get(name); !found {
-		entry.err = fmt.Errorf("%w: %q（可用风格见 Styles()）", ErrUnknownStyle, name)
-	} else if entry.style, entry.err = dicebear.NewStyle([]byte(def)); entry.err != nil {
+	if entry.style, entry.err = dicebear.NewStyle([]byte(def)); entry.err != nil {
 		entry.err = fmt.Errorf("avatar: 解析 %s 风格定义失败: %w", name, entry.err)
 	}
 	g.cache[name] = entry

@@ -96,12 +96,19 @@ func main() {
 ### 与 logger 包打通
 
 ```go
-base := logger.Default().Handler()
-handler := infratrace.NewLogHandler(base)
-// 用 handler 重建全局 slog，或经 logger 的自定义入口替换。
-// 效果：凡是在 span 内打的日志自动多两个字段：
-// {"msg":"...","trace_id":"4bf92f35...","span_id":"00f067aa..."}
+// 注册一次即可；与 logger.Init 的先后顺序无关
+logger.SetHandlerWrapper(infratrace.NewLogHandler)
 ```
+
+`NewLogHandler` 的签名是 `func(slog.Handler) slog.Handler`，正好匹配 `logger.HandlerWrapper`，无需适配层。效果：凡是在 span 内打的日志自动多两个字段：
+
+```json
+{"msg":"...","trace_id":"4bf92f35...","span_id":"00f067aa..."}
+```
+
+包装器在 logger **构建 handler 时**才套用，因此注册与 `logger.Init` 的
+先后顺序无关，之后重新 `Init`（配置热重载）也不会把它丢掉。只想影响
+某一个 logger 时，也可以自行 `slog.New(infratrace.NewLogHandler(base))`。
 
 手工 `logger.WithTraceID` 与本机制**可共存**：记录上已存在 `trace_id`
 字段时 Handler 不再追加（避免 JSON 重复键），手工值优先。

@@ -10,6 +10,7 @@
 - **彩色终端输出**：text 格式 + 终端输出时自动着色（尊重 `NO_COLOR`/`FORCE_COLOR`），JSON 与文件输出永不携带色码；
 - **体积轮转**：文件输出时按大小轮转，历史文件按"数量 + 天数"双条件清理，可选 gzip 压缩；
 - **trace_id 透传**：`WithTraceID(ctx, id)` 后经任何出口输出的日志自动携带 `trace_id` 字段；
+- **Handler 包装接缝**：`SetHandlerWrapper(fn)` 把 `tracing.NewLogHandler` 之类的包装器注册进底座，全进程日志（含包级函数、`Plog`、GORM 适配器）自动带上 OTel span 的 `trace_id`/`span_id`；注册与 `Init` 的先后顺序无关，且**不引入任何第三方依赖**（`HandlerWrapper` 只是 `func(slog.Handler) slog.Handler`）；
 - **GORM 适配**：`logger.Mysql` 实现 `gorm.io/gorm/logger.Interface`，SQL 日志统一汇入全局日志器；
 - **caller 默认开启，输出统一为 `函数:行号`**：text 与 JSON 都是 `source=handler.GetUser:42` 形式的字符串（slog 原生 text 只给文件:行号、JSON 给对象，本包统一改写），所有出口都指向业务调用处、不会被包装函数污染；可用 `DisableCaller` 关闭；
 - **Fatal 语义完整**：`Fatalf` 先刷盘再 `os.Exit(1)`，级别渲染为 `fatal` 且高于 error，退出路径可测（`exitFunc` 注入 + 子进程断言）。
@@ -114,6 +115,7 @@ time=2026-09-16T12:00:00.000+08:00 level=info source=handler.GetUser:42 msg="服
 | `Close() error` | 刷新并关闭文件句柄，随后回落到默认实例（stdout），可重复调用 |
 | `Sync() error` | 刷盘；文件输出时等价于 fsync |
 | `SetLevel(level string)` | 运行期调级（debug/info/warn/error/fatal），热生效 |
+| `SetHandlerWrapper(w HandlerWrapper)` | 注册（传 `nil` 撤销）底层 Handler 包装器，如 `tracing.NewLogHandler`；已存在的实例**就地换 handler**，不动输出、不重开文件 |
 
 ### 包级日志函数（printf 风格）
 
@@ -173,11 +175,25 @@ sub.Warn(ctx, "连接池已满", "inUse", 8, "max", 10)
 
 ### trace_id 透传
 
+两条路径，可共存。
+
+**1. 手工注入**（没有 OTel 时，或想用业务自己的关联 ID）：
+
 ```go
 ctx := logger.WithTraceID(r.Context(), traceID) // 中间件里注入
 logger.NewPlog("Order").Infof(ctx, "下单成功, 订单号: %s", orderNo)
 // 输出自动携带 trace_id="..."
 ```
+
+**2. 注册 OTel Handler 包装器**（推荐：全自动，不依赖每个调用点的纪律）：
+
+```go
+logger.SetHandlerWrapper(tracing.NewLogHandler) // go-infra/tracing
+```
+
+之后凡是 ctx 里带 span 的日志出口（包级函数、`Plog`、`logger.Ctx`、GORM 适配器）都会自动补上 `trace_id` 与 `span_id`。`tracing.NewLogHandler` 的签名正好是 `func(slog.Handler) slog.Handler`，可直接作为参数传入，无需适配层。
+
+两者同时生效时，**记录上已有 `trace_id` 就不再追加**（避免 JSON 里出现重复键）——即手工注入的值优先。
 
 ## GORM SQL 日志接入
 
@@ -210,6 +226,7 @@ db, err := gorm.Open(mysql.Open(dsn), &gorm.Config{
 3. **色彩经 writer 层还原**：`TextHandler` 渲染层会把 `ReplaceAttr` 注入的 ESC 字节转义成字面量 `\x1b`，终端无法显色；`colorUnescapeWriter` 负责还原真实 ESC 字节，仅在 text+stdout 彩色分支接入。
 4. **printf 防误解析**：无参数时不做 `Sprintf`，避免消息中的 `%` 被误解析。
 5. **统一 source 表示**：`slog` 对 source 的处理两种 handler 不一致——text 渲染 `文件:行号`（丢函数名）、JSON 渲染 `{function,file,line}` 对象；本包在 `ReplaceAttr` 中拦截 `slog.SourceKey`（此时值是 `*slog.Source`），统一返回 `slog.String(SourceKey, "包名.函数:行号")`。返回 `slog.String` 后 handler 的 `*Source` 特判分支不再命中，两种格式输出自然一致。
+6. **包装器只在唯一构建点套用**：`build → newHandler` 是 Init 热替换、Close 回落、未 Init 懒加载三条路径的共同出口，`applyHandlerWrapper` 挂在那里，注册与初始化因此天然顺序无关。`SetHandlerWrapper` 对已存在的实例是**就地换 handler**（复用同一个 writer 与配置），而不是按配置整体重建——后者会退化成默认配置，还会关闭并重开日志文件，在关/开之间露出一个"往已关闭句柄写日志"的窗口。同理，换 handler 时**必须继承 `LevelVar` 的当前值**，否则 `SetLevel` 的热调级会被静默回滚到配置文件里的级别。
 
 ## 运行测试
 
@@ -218,4 +235,4 @@ cd <仓库根目录>
 go test ./logger/ -race -count=1 -v
 ```
 
-测试覆盖：未初始化可用、级别过滤与热调级、caller 定位（`函数:行号`）、printf 展开、trace_id、Plog 副本不可变性、并发不丢日志、轮转数量/压缩/按天清理、色彩开关（含 `NO_COLOR`/`FORCE_COLOR`）、GORM 级别映射与 Trace 分支、Fatal（退出码 1、`level=fatal`、Level=error 时仍输出、子进程验证真实退出）。
+测试覆盖：未初始化可用、级别过滤与热调级、caller 定位（`函数:行号`）、printf 展开、trace_id、Plog 副本不可变性、并发不丢日志、轮转数量/压缩/按天清理、色彩开关（含 `NO_COLOR`/`FORCE_COLOR`）、GORM 级别映射与 Trace 分支、Fatal（退出码 1、`level=fatal`、Level=error 时仍输出、子进程验证真实退出）、Handler 包装接缝（注册在 Init 前/后、撤销、重新 Init 后仍生效、配置与热调级继承、输出复用不重开文件、调用方 ctx 透传、并发换 handler）。

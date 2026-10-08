@@ -39,17 +39,23 @@ func ExampleInit() {
 	_ = time.Second
 }
 
-// 日志-链路自动关联：包装 slog Handler 后，所有日志在 span 内
-// 自动携带 trace_id / span_id，无需手工 logger.WithTraceID。
+// 日志-链路自动关联：把 Handler 装饰器注册进 logger 底座后，
+// 所有日志在 span 内自动携带 trace_id / span_id，无需手工 logger.WithTraceID。
 func ExampleNewLogHandler() {
 	if err := logger.Init(logger.Config{}); err != nil {
 		panic(err)
 	}
-	base := logger.Default().Handler()
 
-	// 未初始化 tracing 时包装是纯透传 —— 可以在接线前就先上这层。
-	var handler slog.Handler = infratrace.NewLogHandler(base)
-	slog.New(handler).Info("所有日志自动带 trace_id（若当前存在 span）")
+	// 注册一次即可，与 logger.Init 的先后顺序无关；未初始化 tracing 时
+	// 包装是纯透传，因此可以在 tracing 接线之前就先挂上这一层。
+	logger.SetHandlerWrapper(infratrace.NewLogHandler)
+
+	lg := logger.NewPlog("order")
+	lg.Info(context.Background(), "所有日志自动带 trace_id（若当前存在 span）")
+
+	// 只想影响某一个 logger 时，也可以自行套用：
+	base := logger.Default().Handler()
+	_ = slog.New(infratrace.NewLogHandler(base))
 }
 
 // HTTP 进出口：服务端中间件 + 客户端 RoundTripper 组成完整链路。

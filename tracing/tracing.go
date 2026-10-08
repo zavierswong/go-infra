@@ -8,8 +8,8 @@
 //
 //   - 全局 TracerProvider / Propagator 就位，任何持有 otel API 的
 //     第三方库（gorm 插件、各官方 instrumentation）自动接入；
-//   - 用 [NewLogHandler] 包装 slog Handler，所有日志自动携带
-//     trace_id / span_id，与 logger 包的手工 trace_id 机制互通；
+//   - 用 [NewLogHandler] 配合 logger.SetHandlerWrapper 注册后，所有日志
+//     自动携带 trace_id / span_id，与 logger 包的手工 trace_id 机制互通；
 //   - HTTP 进出口用 [HTTPMiddleware] 与 [NewRoundTripper]，
 //     MQ/自定义协议用 [InjectHeaders] / [ExtractHeaders]（或
 //     [InjectMap] / [ExtractMap]）手工搬运上下文。

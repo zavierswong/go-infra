@@ -18,12 +18,22 @@ type state struct {
 	logger *slog.Logger
 	level  *slog.LevelVar // 支持运行期动态调级
 	closer io.Closer      // 文件输出时的轮转 writer，stdout/stderr 为 nil
+	// out 与 cfg 是"重建 handler"所需的两样东西：SetHandlerWrapper 在
+	// 运行期换 handler 时直接复用现有 out 与 cfg，不重新解析配置、更不
+	// 关闭重开输出——否则重建会退化成默认配置，还会在关/开之间露出一个
+	// 往已关闭句柄写日志的窗口。
+	out io.Writer
+	cfg Config
 }
 
 var (
 	global      atomic.Pointer[state]
-	mu          sync.Mutex // 串行化 Init/Close，避免并发替换时漏关文件句柄
+	mu          sync.Mutex // 串行化 Init/Close/SetHandlerWrapper，避免并发替换时漏关文件句柄
 	defaultOnce sync.Once
+	// handlerWrapper 已注册的 Handler 包装器，nil 表示不包装。
+	// 用 atomic.Pointer 而非普通变量：build 也在 current() 的懒加载
+	// 路径上被调用，那条路径不持锁。
+	handlerWrapper atomic.Pointer[HandlerWrapper]
 )
 
 // callerSkip 固定调用深度，必须与 emit 的调用链保持一致：
@@ -50,6 +60,72 @@ func Init(cfg Config) error {
 		_ = prev.closer.Close()
 	}
 	return nil
+}
+
+// HandlerWrapper 包装底层 slog.Handler，用于在 Write 之前改写/补充日志记录。
+//
+// 典型用法是接入链路追踪（tracing 包提供的包装器签名正好匹配）：
+//
+//	logger.SetHandlerWrapper(tracing.NewLogHandler)
+//
+// 接入后，凡是 ctx 里带 OTel span 的日志（包级函数、Plog、GORM 适配器）
+// 都会自动补上 trace_id / span_id，不再需要每个调用点手工注入。
+type HandlerWrapper func(slog.Handler) slog.Handler
+
+// SetHandlerWrapper 注册 Handler 包装器；传 nil 表示撤销包装。
+//
+// # 为什么是"注册制"而不是"传入一个已包装好的 Handler"
+//
+// 传入现成 Handler 的写法（`logger.WrapHandler(tracing.NewLogHandler(Default().Handler()))`）
+// 要求调用方先拿到一个**当前**的底层 Handler，于是把三件事绑死了：必须先 Init
+// （否则拿不到目标配置的 handler）、拿到之后不能再 Init（重新 Init 会让包装
+// 静默失效）、也不能依赖未 Init 时的懒加载默认实例。三处的失败形态都是
+// "日志照样打，只是 trace_id 不见了"——没有编译错误、没有运行时报错。
+//
+// 注册制把套用时机挪到 build 内部，于是**注册与 Init 的先后顺序无关**：
+//
+//	logger.Init(cfg)                     // 先初始化
+//	logger.SetHandlerWrapper(wrapper)    // 后注册：下面会按原配置重建，立即生效
+//	logger.Init(otherCfg)                // 再 Init：build 时再次套用，不会丢
+//
+// # 语义细节
+//
+//   - 包装器在**每次构建 handler 时**套用，因此 Init 热替换、Close 回落、
+//     未 Init 的懒加载默认实例都会带上它；
+//   - 已存在的实例会**就地换 handler**：复用原有输出与配置，只重建 handler
+//     本身，并继承运行期 SetLevel 的调整（不继承的话热调级会被静默回滚到
+//     配置文件里的级别）；
+//   - 只换 handler 意味着**不关闭、不重开日志文件**——Init 的热替换会关旧
+//     句柄，那个窗口里并发写入会打到已关闭的文件上，观测接缝不该顺带引入
+//     这个性质；
+//   - 尚未初始化时不抢先建实例：current() 首次使用时自会读到新包装器，
+//     否则"只 import logger 却不打日志"的进程会平白多出一个文件句柄。
+func SetHandlerWrapper(w HandlerWrapper) {
+	mu.Lock()
+	defer mu.Unlock()
+
+	if w == nil {
+		handlerWrapper.Store(nil)
+	} else {
+		handlerWrapper.Store(&w)
+	}
+
+	prev := global.Load()
+	if prev == nil {
+		return
+	}
+
+	handler, levelVar := newHandler(prev.out, prev.cfg)
+	if prev.level != nil {
+		levelVar.Set(prev.level.Level())
+	}
+	global.Store(&state{
+		logger: newLogger(handler, prev.cfg),
+		level:  levelVar,
+		closer: prev.closer, // 原样保留：输出不换，句柄自然不关
+		out:    prev.out,
+		cfg:    prev.cfg,
+	})
 }
 
 // Close 关闭日志器：刷新并关闭文件句柄，随后回落到默认日志器(stdout)，
@@ -307,7 +383,7 @@ func emit(ctx context.Context, l *slog.Logger, level slog.Level, msg string, att
 	}
 }
 
-// build 按配置构建日志器
+// build 按配置构建日志器：先备好输出，再交给 newHandler 构建 handler。
 func build(cfg Config) (*state, error) {
 	var (
 		out    io.Writer
@@ -325,6 +401,22 @@ func build(cfg Config) (*state, error) {
 		out = os.Stdout
 	}
 
+	handler, levelVar := newHandler(out, cfg)
+	return &state{
+		logger: newLogger(handler, cfg),
+		level:  levelVar,
+		closer: closer,
+		out:    out,
+		cfg:    cfg,
+	}, nil
+}
+
+// newHandler 基于**已就绪的输出**构建 handler（含色彩处理与包装器），
+// 并返回承载当前级别的 LevelVar。
+//
+// 与 build 拆开，是为了让 SetHandlerWrapper 能复用现有输出重建 handler：
+// 换 handler 不需要碰 writer，日志文件既不关闭也不重开。
+func newHandler(out io.Writer, cfg Config) (slog.Handler, *slog.LevelVar) {
 	levelVar := new(slog.LevelVar)
 	levelVar.Set(parseLevel(cfg.Level))
 
@@ -386,11 +478,28 @@ func build(cfg Config) (*state, error) {
 		handler = slog.NewJSONHandler(out, opts)
 	}
 
+	// 包装器在**唯一的构建点**套用，这是"注册制"的全部要害：Init 热替换、
+	// Close 回落、未 Init 时的懒加载默认实例都经由本函数，因此注册与初始化
+	// 的先后顺序不影响结果。
+	return applyHandlerWrapper(handler), levelVar
+}
+
+// newLogger 用 handler 组装 logger（附带 service 字段）。
+func newLogger(handler slog.Handler, cfg Config) *slog.Logger {
 	l := slog.New(handler)
 	if cfg.Service != "" {
 		l = l.With(slog.String("service", cfg.Service))
 	}
-	return &state{logger: l, level: levelVar, closer: closer}, nil
+	return l
+}
+
+// applyHandlerWrapper 套用已注册的包装器；未注册时原样返回。
+func applyHandlerWrapper(h slog.Handler) slog.Handler {
+	w := handlerWrapper.Load()
+	if w == nil {
+		return h
+	}
+	return (*w)(h)
 }
 
 // message 仅在有参数时格式化，避免无参数时误解析字符串中的 %

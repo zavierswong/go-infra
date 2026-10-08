@@ -10,13 +10,20 @@ import (
 // NewLogHandler 返回一个会在每条日志上追加 trace_id / span_id 的
 // slog.Handler 包装器（字段取自 ctx 中的当前 OTel span）。
 //
-// 用法：把它包在 logger 的底层 Handler 外层，进程内所有走
-// slog 的日志（含 logger 包全局函数与 Plog）在 span 存在时
+// 用法：注册进 logger 包即可，进程内所有走 slog 的日志
+// （含 logger 包全局函数、Plog 与 GORM 适配器）在 span 存在时
 // 自动携带链路字段，不再依赖手工 logger.WithTraceID：
 //
-//	handler := tracing.NewLogHandler(logger.Default().Handler())
-//	logger.WrapHandler(handler) // 若 logger 包提供替换入口
-//	// 或自行 slog.New(handler) 构造业务专用 logger
+//	logger.SetHandlerWrapper(tracing.NewLogHandler)
+//
+// 用"注册"而不是"自行包装后替换"：包装器在 logger 构建 handler 时才套用，
+// 因此注册与 logger.Init 的先后顺序无关，之后重新 Init（配置热重载）
+// 也不会把它丢掉。本函数签名恰好是 func(slog.Handler) slog.Handler，
+// 可直接作为 logger.HandlerWrapper 传入，无需适配层。
+//
+// 不经 logger 包、只想影响某一个 logger 时，也可以自行套用：
+//
+//	lg := slog.New(tracing.NewLogHandler(baseHandler))
 //
 // 语义细节：
 //   - 记录上已存在 trace_id 字段（例如业务先用 logger.WithTraceID
